@@ -5,6 +5,8 @@ from typing import Dict, Optional
 import torch
 from torch import Tensor
 
+from mmdet.models import TwoStageDetector, SingleStageDetector
+
 from mmtrack.registry import MODELS
 from mmtrack.structures import TrackDataSample
 from mmtrack.utils import OptConfigType, OptMultiConfig, SampleList
@@ -53,6 +55,32 @@ class QDTrack(BaseMultiObjectTracker):
             self.freeze_module('detector')
 
     def loss(self, inputs: Dict[str, Tensor], data_samples: SampleList,
+             **kwargs) -> dict:
+        """Calculate losses from a batch of inputs and data samples.
+
+        Args:
+            inputs (Dict[str, Tensor]): of shape (N, T, C, H, W) encoding
+                input images. Typically these should be mean centered and std
+                scaled. The N denotes batch size.The T denotes the number of
+                key/reference frames.
+                - img (Tensor) : The key images.
+                - ref_img (Tensor): The reference images.
+            data_samples (list[:obj:`TrackDataSample`]): The batch
+                data samples. It usually includes information such
+                as `gt_instance`.
+
+        Returns:
+            dict: A dictionary of loss components.
+        """
+        if isinstance(self.detector, SingleStageDetector):
+            return self._loss_single_stage(inputs, data_samples, **kwargs)
+        elif isinstance(self.detector, TwoStageDetector):
+            return self._loss_two_stage(inputs, data_samples, **kwargs)
+        else:
+            assert False  # TODO: rewrite this if!
+
+
+    def _loss_two_stage(self, inputs: Dict[str, Tensor], data_samples: SampleList,
              **kwargs) -> dict:
         """Calculate losses from a batch of inputs and data samples.
 
@@ -134,6 +162,98 @@ class QDTrack(BaseMultiObjectTracker):
 
         return losses
 
+
+    def _loss_single_stage(self, inputs: Dict[str, Tensor], data_samples: SampleList,
+             **kwargs) -> dict:
+        """Calculate losses from a batch of inputs and data samples.
+
+        Args:
+            inputs (Dict[str, Tensor]): of shape (N, T, C, H, W) encoding
+                input images. Typically these should be mean centered and std
+                scaled. The N denotes batch size.The T denotes the number of
+                key/reference frames.
+                - img (Tensor) : The key images.
+                - ref_img (Tensor): The reference images.
+            data_samples (list[:obj:`TrackDataSample`]): The batch
+                data samples. It usually includes information such
+                as `gt_instance`.
+
+        Returns:
+            dict: A dictionary of loss components.
+        """
+        # modify the inputs shape to fit mmdet
+        img = inputs['img']
+        assert img.dim() == 5, 'The img must be 5D Tensor (N, T, C, H, W).'
+        assert img.size(1) == 1, \
+            'QDTrack can only have 1 key frame and 1 reference frame.'
+        img = img[:, 0]
+
+        ref_img = inputs['ref_img']
+        assert ref_img.dim() == 5, 'The img must be 5D Tensor (N, T, C, H, W).'
+        assert ref_img.size(1) == 1, \
+            'QDTrack can only have 1 key frame and 1 reference frame.'
+        ref_img = ref_img[:, 0]
+
+        x = self.detector.extract_feat(img)
+        ref_x = self.detector.extract_feat(ref_img)
+
+        losses = dict()
+
+        rpn_data_samples = copy.deepcopy(data_samples)
+        # set cat_id of gt_labels to 0 in RPN
+        for data_sample in rpn_data_samples:
+            data_sample.gt_instances.labels = \
+                torch.zeros_like(data_sample.gt_instances.labels)
+        # bbox_losses, rpn_results_list = self.detector.bbox_head. \
+        #     loss_and_predict(x,
+        #                      rpn_data_samples,
+        #                      **kwargs)
+        outs = self.detector.bbox_head(x)
+        batch_img_metas = [
+            data_samples.metainfo for data_samples in rpn_data_samples
+        ]
+        rpn_results_list = self.detector.bbox_head.predict_by_feat(
+            *outs, with_nms=False, batch_img_metas=batch_img_metas
+        )
+        bbox_losses = self.detector.bbox_head.loss(
+            x, rpn_data_samples
+        )
+        # avoid get same name with roi_head loss
+        # keys = rpn_losses.keys()
+        # for key in keys:
+        #     if 'loss' in key and 'rpn' not in key:
+        #         rpn_losses[f'rpn_{key}'] = rpn_losses.pop(key)
+        losses.update(bbox_losses)
+
+        # losses_detect = self.detector.roi_head.loss(x, rpn_results_list,
+        #                                             data_samples, **kwargs)
+        # losses.update(losses_detect)
+        # adjust the key of ref_img in data_samples
+        ref_rpn_data_samples = []
+        for data_sample in data_samples:
+            ref_rpn_data_sample = TrackDataSample()
+            ref_rpn_data_sample.set_metainfo(
+                metainfo=dict(
+                    img_shape=data_sample.metainfo['ref_img_shape'],
+                    scale_factor=data_sample.metainfo['ref_scale_factor']))
+            ref_rpn_data_samples.append(ref_rpn_data_sample)
+        # red predictions
+        # ref_rpn_results_list = self.detector.bbox_head.predict(
+        #     ref_x, ref_rpn_data_samples, **kwargs)
+        ref_outs = self.detector.bbox_head(ref_x)
+        ref_batch_img_metas = [
+            data_samples.metainfo for data_samples in ref_rpn_data_samples
+        ]
+        ref_rpn_results_list = self.detector.bbox_head.predict_by_feat(
+            *ref_outs, with_nms=False, batch_img_metas=ref_batch_img_metas
+        )
+        losses_track = self.track_head.loss(x, ref_x, rpn_results_list,
+                                            ref_rpn_results_list, data_samples,
+                                            **kwargs)
+        losses.update(losses_track)
+
+        return losses
+        
     def predict(self,
                 inputs: Dict[str, Tensor],
                 data_samples: SampleList,
@@ -175,9 +295,16 @@ class QDTrack(BaseMultiObjectTracker):
             self.tracker.reset()
 
         x = self.detector.extract_feat(img)
-        rpn_results_list = self.detector.rpn_head.predict(x, data_samples)
-        det_results = self.detector.roi_head.predict(
-            x, rpn_results_list, data_samples, rescale=rescale)
+
+        if isinstance(self.detector, SingleStageDetector):
+            det_results = self.detector.bbox_head.predict(
+                x, data_samples, rescale=rescale)
+        elif isinstance(self.detector, TwoStageDetector):
+            rpn_results_list = self.detector.rpn_head.predict(x, data_samples)
+            det_results = self.detector.roi_head.predict(
+                x, rpn_results_list, data_samples, rescale=rescale)
+        else:
+            assert False  # TODO: rewrite this if!
 
         track_data_sample = data_samples[0]
         track_data_sample.pred_det_instances = \
