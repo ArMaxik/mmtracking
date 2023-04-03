@@ -217,6 +217,7 @@ class QuasiDenseTracker(BaseTracker):
         bboxes = data_sample.pred_det_instances.bboxes
         labels = data_sample.pred_det_instances.labels
         scores = data_sample.pred_det_instances.scores
+        valid_mask = data_sample.pred_det_instances.valid_mask
 
         frame_id = metainfo.get('frame_id', -1)
         # create pred_track_instances
@@ -235,7 +236,8 @@ class QuasiDenseTracker(BaseTracker):
             scale_factor = rescaled_bboxes.new_tensor(
                 metainfo['scale_factor']).repeat((1, 2))
             rescaled_bboxes = rescaled_bboxes * scale_factor
-        track_feats = model.track_head.predict(feats, [rescaled_bboxes])
+        # TODO: add if for one/two stage
+        track_feats = model.track_head.predict(feats, valid_mask)
         # sort according to the object_score
         _, inds = scores.sort(descending=True)
         bboxes = bboxes[inds]

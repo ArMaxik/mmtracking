@@ -5,6 +5,7 @@ from mmdet.structures.bbox import bbox2roi
 from mmdet.models.task_modules.assigners.assign_result import AssignResult
 from mmdet.models.task_modules.samplers.sampling_result import SamplingResult
 from torch import Tensor
+import torch
 
 from mmtrack.registry import MODELS
 from mmtrack.utils import InstanceList, SampleList
@@ -116,8 +117,7 @@ class QuasiDenseTrackHead(RoITrackHead):
         return loss_track
 
     def predict(self, feats: List[Tensor],
-                rescaled_bboxes: List[Tensor],
-                assign_result) -> Tensor:
+                rescaled_bboxes: List[Tensor]) -> Tensor:
         """Perform forward propagation of the tracking head and predict
         tracking results on the features of the upstream network.
 
@@ -144,7 +144,8 @@ class QuasiDenseTrackHeadOneStage(QuasiDenseTrackHead):
 
     def extract_roi_feats(self, feats: List[Tensor],
                           sampling_results: List[SamplingResult],
-                          assign_result: List[AssignResult]) -> Tensor:
+                          assign_result: List[AssignResult],
+                          rpn_results_list: InstanceList,) -> Tensor:
         """Extract roi features.
 
         Args:
@@ -154,11 +155,50 @@ class QuasiDenseTrackHeadOneStage(QuasiDenseTrackHead):
         Returns:
             Tensor: The extracted roi features.
         """
-        gt_bboxes = [res.pos_bboxes[res.pos_is_gt] for res in sampling_results]
-        rois = bbox2roi(gt_bboxes)
-        bbox_feats = self.roi_extractor(feats[:self.roi_extractor.num_inputs],
-                                        rois)
-        return bbox_feats
+        # pred_bboxes_inds = [res.pos_inds[(1-res.pos_is_gt).bool()] - res.num_gts for res in sampling_results]
+        # feat_inds = [res.valid_mask[pb_ind] for res, pb_ind in zip(rpn_results_list, pred_bboxes_inds)]
+        feat_inds = [res.valid_mask[res.pos_inds[res.num_gts:]] for res in sampling_results]
+        flat_feats = [torch.cat([f[i].view(f[i].shape[0],-1) for f in feats], dim=1) for i in range(len(assign_result))]
+        pred_feats = [f.T[f_ind.long()] for f, f_ind in zip(flat_feats,feat_inds)]
+        gt_bboxes = [res.pos_bboxes[:res.num_gts] for res in sampling_results]
+        
+        roi_features = []
+        for pred_f, gt_bbox in zip(pred_feats, gt_bboxes):
+            rois = bbox2roi([gt_bbox])
+            bbox_feats = self.roi_extractor(feats[:self.roi_extractor.num_inputs],
+                                            rois)
+            roi_features.append(torch.cat([bbox_feats, torch.unsqueeze(torch.unsqueeze(pred_f, -1), -1)]))
+        return torch.cat(roi_features)
+    
+    def extract_ref_roi_feats(self, feats: List[Tensor],
+                          sampling_results: List[SamplingResult],
+                          assign_result: List[AssignResult],
+                          rpn_results_list: InstanceList,) -> Tensor:
+        """Extract roi features.
+
+        Args:
+            feats (list[Tensor]): list of multi-level image features.
+            bboxes (list[Tensor]): list of bboxes in sampling result.
+
+        Returns:
+            Tensor: The extracted roi features.
+        """
+        # real_gt_num = [(s.pos_is_gt == 1).sum()for s in sampling_results] # WHY ARE THEY DIFFER?!!!
+        feat_inds = [res.valid_mask[torch.cat([res.pos_inds[res.num_gts:],res.neg_inds])] for res in sampling_results]
+        flat_feats = [torch.cat([f[i].view(f[i].shape[0],-1) for f in feats], dim=1) for i in range(len(assign_result))]
+        pred_feats = [f.T[f_ind.long()] for f, f_ind in zip(flat_feats,feat_inds)]
+        gt_bboxes = [res.pos_bboxes[:res.num_gts] for res in sampling_results]
+        
+        roi_features = []
+        for pred_f, gt_bbox in zip(pred_feats, gt_bboxes):
+            rois = bbox2roi([gt_bbox])
+            bbox_feats = self.roi_extractor(feats[:self.roi_extractor.num_inputs],
+                                            rois)
+            roi_features.append(torch.cat([bbox_feats, torch.unsqueeze(torch.unsqueeze(pred_f, -1), -1)]))
+        
+        for roi_feature, sampling_result in zip(roi_features, sampling_results):
+            assert roi_feature.shape[0] == sampling_result.bboxes.shape[0]
+        return torch.cat(roi_features)
 
     def loss(self, key_feats: List[Tensor], ref_feats: List[Tensor],
              rpn_results_list: InstanceList,
@@ -237,10 +277,17 @@ class QuasiDenseTrackHeadOneStage(QuasiDenseTrackHead):
         key_roi_feats = self.extract_roi_feats(
             key_feats,
             key_sampling_results,
-            key_assign_results
+            key_assign_results,
+            rpn_results_list
         )
         # ref_bboxes = [res.bboxes for res in ref_sampling_results]
         # ref_roi_feats = self.extract_roi_feats(ref_feats, ref_bboxes)
+        ref_roi_feats = self.extract_ref_roi_feats(
+            ref_feats,
+            ref_sampling_results,
+            ref_assign_results,
+            ref_rpn_results_list
+        )
 
         loss_track = self.embed_head.loss(key_roi_feats, ref_roi_feats,
                                           key_sampling_results,
@@ -248,3 +295,22 @@ class QuasiDenseTrackHeadOneStage(QuasiDenseTrackHead):
                                           gt_match_indices_list)
 
         return loss_track
+
+    def predict(self, feats: List[Tensor],
+                valid_mask: List[Tensor]) -> Tensor:
+        """Perform forward propagation of the tracking head and predict
+        tracking results on the features of the upstream network.
+
+        Args:
+            feats (list[Tensor]): Multi level feature maps of `img`.
+            rescaled_bboxes (list[Tensor]): list of rescaled bboxes in sampling
+                result.
+
+        Returns:
+            Tensor: The extracted track features.
+        """
+        flat_feats = [torch.cat([f[i].view(f[i].shape[0],-1) for f in feats], dim=1) for i in range(feats[0].shape[0])]
+        pred_feats = [f.T[f_ind.long()] for f, f_ind in zip(flat_feats, [valid_mask])]
+        pred_feats= torch.unsqueeze(torch.unsqueeze(pred_feats[0], -1), -1)
+        track_feats = self.embed_head.predict(pred_feats)
+        return track_feats
