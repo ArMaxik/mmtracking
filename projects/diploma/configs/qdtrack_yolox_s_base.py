@@ -7,7 +7,7 @@ custom_imports = dict(imports=['models'], allow_failed_imports=False)
 
 
 model = dict(
-    type='QDTrack',
+    type='QDTrackOneStage',
     data_preprocessor=dict(
         _delete_=True,
         type='TrackDataPreprocessor',
@@ -19,16 +19,25 @@ model = dict(
     detector=dict(
         bbox_head=dict(
             type='YOLOX_QDTrackHead',
-            num_classes=1),
+            num_classes=1,
+            train_cfg=dict(
+                track_sampler=dict(
+                    _scope_='mmdet',
+                    type='CombinedSampler',
+                    num=256,
+                    pos_fraction=0.5,
+                    neg_pos_ub=3,
+                    add_gt_as_proposals=False,
+                    pos_sampler=dict(type='InstanceBalancedPosSampler'),
+                    neg_sampler=dict(type='RandomSampler')))),
         init_cfg=dict(
             type='Pretrained',
             checkpoint=  # noqa: E251
             '/raid/veliseev/dev/mmdetection_3.0/work_dirs/yolox_s_8xb8-100e_coco-people/best_coco'
-            '/bbox_mAP_epoch_99.pth'
-            # noqa: E501
+            '/bbox_mAP_epoch_99.pth'# noqa: E501
         )),
     track_head=dict(
-        type='QDTrackOneStage',
+        type='QuasiDenseTrackHead',
         roi_extractor=dict(
             _scope_='mmdet',
             type='SingleRoIExtractor',

@@ -14,8 +14,9 @@ from torch import Tensor
 from mmdet.structures import SampleList
 from mmdet.models.task_modules import SamplingResult
 
-from mmdet.registry import MODELS as MMDETMODELS
+from mmdet.registry import MODELS as MMDETMODELS, TASK_UTILS
 from mmtrack.registry import MODELS
+from mmtrack.models.task_modules.track import embed_similarity
 from mmdet.structures.bbox import bbox_xyxy_to_cxcywh
 from mmdet.utils import (ConfigType, OptConfigType, OptInstanceList,
                          OptMultiConfig, reduce_mean)
@@ -74,6 +75,9 @@ class YOLOX_QDTrackHead(YOLOXHead):
         else:
             self.loss_track_aux = None
 
+        if self.train_cfg:
+            self.track_sampler = TASK_UTILS.build(self.train_cfg['track_sampler'])
+
 
     def _init_layers(self) -> None:
         """Initialize heads for all level feature maps."""
@@ -82,7 +86,14 @@ class YOLOX_QDTrackHead(YOLOXHead):
         self.multi_level_conv_embed = nn.ModuleList()
 
         for _ in self.strides:
-            self.multi_level_embed_convs.append(self._build_stacked_convs())
+            self.multi_level_embed_convs.append(
+                    ConvModule(
+                        self.in_channels,
+                        self.in_channels,
+                        3,
+                        padding=1,
+                        conv_cfg=self.conv_cfg,
+                        norm_cfg=self.norm_cfg))
             conv_embed = self._build_embed_predictor()
             self.multi_level_conv_embed.append(conv_embed)
     
@@ -99,11 +110,11 @@ class YOLOX_QDTrackHead(YOLOXHead):
             conv_embed.bias.data.fill_(bias_init)
 
     def forward_single(self, x: Tensor, cls_convs: nn.Module,
-                       reg_convs: nn.Module, conv_cls: nn.Module,
-                       embed_convs: nn.Module,
+                       reg_convs: nn.Module, embed_convs: nn.Module,
+                       conv_cls: nn.Module,
                        conv_reg: nn.Module,
-                       conv_obj: nn.Module,
-                       conv_embed: nn.Module
+                       conv_embed: nn.Module,
+                       conv_obj: nn.Module
                     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """Forward feature of a single scale level."""
 
@@ -133,8 +144,8 @@ class YOLOX_QDTrackHead(YOLOXHead):
                            self.multi_level_embed_convs,
                            self.multi_level_conv_cls,
                            self.multi_level_conv_reg,
-                           self.multi_level_conv_obj,
-                           self.multi_level_conv_embed)
+                           self.multi_level_conv_embed,
+                           self.multi_level_conv_obj)
     
     def loss_tracking(self,
                    x: Tuple[Tensor], batch_data_samples: SampleList,
@@ -194,15 +205,16 @@ class YOLOX_QDTrackHead(YOLOXHead):
             batch_img_metas,
             batch_gt_instances_ignore
         )
-        sampling_result, _ = self._get_sampling_and_assign_results(
+        sampling_result, _ = multi_apply(
+            self._get_sampling_and_assign_results,
             flatten_priors,
             flatten_cls_preds,
             flatten_bbox_preds,
-            flatten_embed_preds,
             flatten_objectness,
             batch_gt_instances,
             batch_img_metas,
-            batch_gt_instances_ignore
+            batch_gt_instances_ignore,
+            [True]*len(flatten_priors)
         )
         # Preparing Ref frame features for track loss
         (ref_cls_score, ref_bbox_pred, ref_embed_pred, ref_objectness) = ref_outs
@@ -220,23 +232,45 @@ class YOLOX_QDTrackHead(YOLOXHead):
             ref_batch_img_metas,
             ref_batch_gt_instances_ignore
         )
-        ref_sampling_result, _ = self._get_sampling_and_assign_results(
+        ref_sampling_result, _ = multi_apply(
+            self._get_sampling_and_assign_results,
             ref_flatten_priors,
             ref_flatten_cls_preds,
             ref_flatten_bbox_preds,
-            ref_flatten_embed_preds,
             ref_flatten_objectness,
             ref_batch_gt_instances,
             ref_batch_img_metas,
-            ref_batch_gt_instances_ignore
+            ref_batch_gt_instances_ignore,
+            [True]*len(flatten_priors)
         )
 
-        loss_track = self.loss_embed_head(
-            flatten_embed_preds, sampling_result,
-            ref_flatten_embed_preds, ref_sampling_result
+        gt_match_indices_list = []
+        for data_sample in batch_data_samples:
+            batch_gt_instances.append(data_sample.gt_instances)
+            ref_batch_gt_instances.append(data_sample.ref_gt_instances)
+            if 'ignored_instances' in data_sample:
+                batch_gt_instances_ignore.append(data_sample.ignored_instances)
+            else:
+                batch_gt_instances_ignore.append(None)
+            # get gt_match_indices
+            ins_ids = data_sample.gt_instances.instances_id.tolist()
+            ref_ins_ids = data_sample.ref_gt_instances.instances_id.tolist()
+            match_indices = Tensor([
+                ref_ins_ids.index(i) if (i in ref_ins_ids and i > 0) else -1
+                for i in ins_ids
+            ]).to(ref_flatten_priors.device)
+            gt_match_indices_list.append(match_indices)
+
+        flatten_embed_preds = torch.cat([embed[s.pos_inds] for s, embed in zip(sampling_result, flatten_embed_preds)])
+        ref_flatten_embed_preds = torch.cat([embed[torch.cat([s.pos_inds,s.neg_inds])] for s, embed in zip(ref_sampling_result, ref_flatten_embed_preds)])
+
+        loss_track = self.loss_by_feat_emned_head(
+            flatten_embed_preds, ref_flatten_embed_preds,
+            sampling_result, ref_sampling_result,
+            gt_match_indices_list
         )
 
-
+        losses.update(loss_track)
         return losses
     
     def loss_embed_head(self, key_roi_feats: Tensor, ref_roi_feats: Tensor,
@@ -272,6 +306,101 @@ class YOLOX_QDTrackHead(YOLOXHead):
                                    key_sampling_results, ref_sampling_results,
                                    gt_match_indices_list)
         return losses
+    
+    def get_targets(
+            self, gt_match_indices: List[Tensor],
+            key_sampling_results: List[SamplingResult],
+            ref_sampling_results: List[SamplingResult]) -> Tuple[List, List]:
+        """Calculate the track targets and track weights for all samples in a
+        batch according to the sampling_results.
+
+        Args:
+            gt_match_indices (list(Tensor)): Mapping from gt_instance_ids to
+                ref_gt_instance_ids of the same tracklet in a pair of images.
+            key_sampling_results (List[obj:SamplingResult]): Assign results of
+                all images in a batch after sampling.
+            ref_sampling_results (List[obj:SamplingResult]): Assign results of
+                all reference images in a batch after sampling.
+
+        Returns:
+            Tuple[list[Tensor]]: Association results.
+            Containing the following list of Tensors:
+
+                - track_targets (list[Tensor]): The mapping instance ids from
+                    all positive proposals in the key image to all proposals
+                    in the reference image, each tensor in list has
+                    shape (len(key_pos_bboxes), len(ref_bboxes)).
+                - track_weights (list[Tensor]): Loss weights for all positive
+                    proposals in a batch, each tensor in list has
+                    shape (len(key_pos_bboxes),).
+        """
+
+        track_targets = []
+        track_weights = []
+        for _gt_match_indices, key_res, ref_res in zip(gt_match_indices,
+                                                       key_sampling_results,
+                                                       ref_sampling_results):
+            targets = _gt_match_indices.new_zeros(
+                (key_res.pos_bboxes.size(0), ref_res.bboxes.size(0)),
+                dtype=torch.int)
+            _match_indices = _gt_match_indices[key_res.pos_assigned_gt_inds]
+            pos2pos = (_match_indices.view(
+                -1, 1) == ref_res.pos_assigned_gt_inds.view(1, -1)).int()
+            targets[:, :pos2pos.size(1)] = pos2pos
+            weights = (targets.sum(dim=1) > 0).float()
+            track_targets.append(targets)
+            track_weights.append(weights)
+        return track_targets, track_weights
+
+    def match(
+        self, key_embeds: Tensor, ref_embeds: Tensor,
+        key_sampling_results: List[SamplingResult],
+        ref_sampling_results: List[SamplingResult]
+    ) -> Tuple[List[Tensor], List[Tensor]]:
+        """Calculate the dist matrixes for loss measurement.
+
+        Args:
+            key_embeds (Tensor): Embeds of positive bboxes in sampling results
+                of key image.
+            ref_embeds (Tensor): Embeds of all bboxes in sampling results
+                of the reference image.
+            key_sampling_results (List[obj:SamplingResults]): Assign results of
+                all images in a batch after sampling.
+            ref_sampling_results (List[obj:SamplingResults]): Assign results of
+                all reference images in a batch after sampling.
+
+        Returns:
+            Tuple[list[Tensor]]: Calculation results.
+            Containing the following list of Tensors:
+
+                - dists (list[Tensor]): Dot-product dists between
+                    key_embeds and ref_embeds, each tensor in list has
+                    shape (len(key_pos_bboxes), len(ref_bboxes)).
+                - cos_dists (list[Tensor]): Cosine dists between
+                    key_embeds and ref_embeds, each tensor in list has
+                    shape (len(key_pos_bboxes), len(ref_bboxes)).
+        """
+
+        num_key_rois = [res.pos_bboxes.size(0) for res in key_sampling_results]
+        key_embeds = torch.split(key_embeds, num_key_rois)
+        num_ref_rois = [res.bboxes.size(0) for res in ref_sampling_results]
+        ref_embeds = torch.split(ref_embeds, num_ref_rois)
+
+        dists, cos_dists = [], []
+        for key_embed, ref_embed in zip(key_embeds, ref_embeds):
+            dist = embed_similarity(
+                key_embed,
+                ref_embed,
+                method='dot_product',
+                temperature=self.softmax_temp)
+            dists.append(dist)
+            if self.loss_track_aux is not None:
+                cos_dist = embed_similarity(
+                    key_embed, ref_embed, method='cosine')
+                cos_dists.append(cos_dist)
+            else:
+                cos_dists.append(None)
+        return dists, cos_dists
 
     def loss_by_feat_emned_head(self, key_track_feats: Tensor, ref_track_feats: Tensor,
                      key_sampling_results: List[SamplingResult],
@@ -375,7 +504,7 @@ class YOLOX_QDTrackHead(YOLOXHead):
             flatten_bbox_preds,
             flatten_embed_preds,
             flatten_objectness,
-            flatten_priors,
+            flatten_priors.unsqueeze(0).repeat(num_imgs, 1, 1),
             flatten_bboxes,
         )
 
@@ -457,7 +586,7 @@ class YOLOX_QDTrackHead(YOLOXHead):
              self._get_targets_single,
              flatten_priors.unsqueeze(0).repeat(num_imgs, 1, 1),
              flatten_cls_preds.detach(),
-             flatten_bboxes.detach(), flatten_embed_preds.detach(),
+             flatten_bboxes.detach(),
              flatten_objectness.detach(), batch_gt_instances, batch_img_metas,
              batch_gt_instances_ignore)
 
@@ -625,7 +754,8 @@ class YOLOX_QDTrackHead(YOLOXHead):
             objectness: Tensor,
             gt_instances: InstanceData,
             img_meta: dict,
-            gt_instances_ignore: Optional[InstanceData] = None
+            gt_instances_ignore: Optional[InstanceData] = None,
+            track_mode: bool = False
     ): # -> What does it return?!
         num_priors = priors.size(0)
         num_gts = len(gt_instances)
@@ -652,7 +782,11 @@ class YOLOX_QDTrackHead(YOLOXHead):
             gt_instances=gt_instances,
             gt_instances_ignore=gt_instances_ignore)
 
-        sampling_result = self.sampler.sample(assign_result, pred_instances,
+        if track_mode:
+            sampling_result = self.track_sampler.sample(assign_result, pred_instances,
+                                              gt_instances)
+        else:
+            sampling_result = self.sampler.sample(assign_result, pred_instances,
                                               gt_instances)
         return sampling_result, assign_result
     
