@@ -733,7 +733,7 @@ class YOLOX_QDTrackHead(YOLOXHead):
                 scores=max_scores[valid_mask] *
                 flatten_objectness[img_id][valid_mask],
                 labels=labels[valid_mask],
-                embeds=flatten_embed_preds[valid_mask])
+                embeds=flatten_embed_preds[img_id][valid_mask])
 
             result_list.append(
                 self._bbox_post_process(
