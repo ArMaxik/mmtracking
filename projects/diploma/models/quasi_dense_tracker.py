@@ -230,19 +230,12 @@ class QuasiDenseTrackerOneStage(BaseTracker):
             pred_track_instances.instances_id = ids
             return pred_track_instances
 
-        # get track feats
-        rescaled_bboxes = bboxes.clone()
-        if rescale:
-            scale_factor = rescaled_bboxes.new_tensor(
-                metainfo['scale_factor']).repeat((1, 2))
-            rescaled_bboxes = rescaled_bboxes * scale_factor
-        track_feats = model.track_head.predict(feats, [rescaled_bboxes])
         # sort according to the object_score
         _, inds = scores.sort(descending=True)
         bboxes = bboxes[inds]
         scores = scores[inds]
         labels = labels[inds]
-        embeds = track_feats[inds, :]
+        embeds = embeds[inds, :]
 
         # duplicate removal for potential backdrops and cross classes
         valids = bboxes.new_ones((bboxes.size(0)))

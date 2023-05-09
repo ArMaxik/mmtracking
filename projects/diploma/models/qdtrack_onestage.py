@@ -42,9 +42,6 @@ class QDTrackOneStage(BaseMultiObjectTracker):
         if detector is not None:
             self.detector = MODELS.build(detector)
 
-        if track_head is not None:
-            self.track_head = MODELS.build(track_head)
-
         if tracker is not None:
             self.tracker = MODELS.build(tracker)
 
@@ -94,34 +91,11 @@ class QDTrackOneStage(BaseMultiObjectTracker):
             data_sample.gt_instances.labels = \
                 torch.zeros_like(data_sample.gt_instances.labels)
 
-        # outs = self.detector.bbox_head(x)
-        # batch_img_metas = [
-        #     data_samples.metainfo for data_samples in rpn_data_samples
-        # ]
-        # rpn_results_list = self.detector.bbox_head.predict_by_feat(
-        #     *outs, with_nms=False, batch_img_metas=batch_img_metas
-        # )
-        # bbox_losses = self.detector.bbox_head.loss(
-        #     x, rpn_data_samples
-        # )
-        # avoid get same name with roi_head loss
-        # keys = rpn_losses.keys()
-        # for key in keys:
-        #     if 'loss' in key and 'rpn' not in key:
-        #         rpn_losses[f'rpn_{key}'] = rpn_losses.pop(key)
-        # losses.update(bbox_losses)
-
-        # losses_detect = self.detector.roi_head.loss(x, rpn_results_list,
-        #                                             data_samples, **kwargs)
-        # losses.update(losses_detect)
         # adjust the key of ref_img in data_samples
         ref_rpn_data_samples = []
         for data_sample in data_samples:
             ref_rpn_data_sample = TrackDataSample()
             ref_rpn_data_sample.set_data(
-                # { a.replace('ref_','') : getattr(data_sample, a) \
-                #   for a in dir(data_sample) if a.startswith('ref_')
-                # }
                 dict(
                     gt_instances=data_sample.ref_gt_instances,
                     ignored_instances=data_sample.ref_ignored_instances,
@@ -133,19 +107,6 @@ class QDTrackOneStage(BaseMultiObjectTracker):
                     scale_factor=data_sample.metainfo['ref_scale_factor'],
                     ))
             ref_rpn_data_samples.append(ref_rpn_data_sample)
-        # ref predictions
-        # ref_rpn_results_list = self.detector.bbox_head.predict(
-        #     ref_x, ref_rpn_data_samples, **kwargs)
-        # ref_outs = self.detector.bbox_head(ref_x)
-        # ref_batch_img_metas = [
-        #     data_samples.metainfo for data_samples in ref_rpn_data_samples
-        # ]
-        # ref_rpn_results_list = self.detector.bbox_head.predict_by_feat(
-        #     *ref_outs, with_nms=False, batch_img_metas=ref_batch_img_metas
-        # )
-        # losses_track = self.track_head.loss(x, ref_x, rpn_results_list,
-        #                                     ref_rpn_results_list, data_samples,
-        #                                     **kwargs)
         
         losses = self.detector.bbox_head.loss_tracking(
             x, rpn_data_samples,
